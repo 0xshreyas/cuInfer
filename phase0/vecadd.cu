@@ -15,6 +15,10 @@ int main() {
     float *d_a, *d_b, *d_c;
     int errors = 0;
     for (int i = 0; i < N; i++) {
+        a[i] = i;
+        b[i] = i * 2;
+    }
+    for (int i = 0; i < N; i++) {
         if (c[i] != a[i] + b[i]) errors++;
     }
     cudaMalloc(&d_a, N * sizeof(float));
@@ -22,10 +26,6 @@ int main() {
     cudaMalloc(&d_c, N * sizeof(float));
     cudaMemcpy(d_a, a, N * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_b, b, N * sizeof(float), cudaMemcpyHostToDevice);
-    for (int i = 0; i < N; i++) {
-        a[i] = i;
-        b[i] = i * 2;
-    }
     int threadsPerBlock = 256;
     int blocks = (N + threadsPerBlock - 1) / threadsPerBlock;
     vecadd_kernel<<<blocks, 256>>>(d_a, d_b, d_c, N);
