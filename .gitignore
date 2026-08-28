@@ -1,2 +1,8 @@
+export/venv/
+export/*.bin
+__pycache__/
+*.o
 hello
 devinfo
+vecadd
+matmul
