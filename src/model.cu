@@ -1,6 +1,25 @@
 #include<stdio.h>
 #include<stdlib.h>
 #define MAGIC 0x63754C4D
+
+__global__ void sum_kernel(const float *in, float *block_sums, size_t n) {
+    __shared__ float sdata[256];
+    int tid = threadIdx.x;
+    //Grid-Stride Loop
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t stride = gridDim.x * blockDim.x;
+    float sum = 0.0f;
+    for(; i < n; i += stride) sum += in[i];
+    sdata[tid] = sum;
+    __syncthreads();
+
+    for(int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) block_sums[blockIdx.x] = sdata[0];
+}
+
 // Structure for the loader includes the 12 tensors in a layer and parameters of a model
 typedef struct {
     float *ln_1_w, *ln_1_b;
@@ -109,6 +128,42 @@ int model_load(Model *m, const char *path) {
 void model_free(Model *m) {
     cudaFree(m->all);
 }
+
+// To Verify the data from the GPU side, first method which is Copy back & check
+void peek(const char *label, float *ptr, int n) {
+    float host[8];
+    cudaMemcpy(host, ptr, n * sizeof(float), cudaMemcpyDeviceToHost);
+    printf("%s: ", label);
+    for (int i = 0; i < n; i++) printf("%.8f ", host[i]);
+    printf("\n");
+}
+
+double sum_on_gpu(const float *ptr, size_t n) {
+    int blocks = 256;
+    int threads = 256;
+    float *d_block_sums;
+    cudaError_t e = cudaMalloc(&d_block_sums, blocks * sizeof(float));
+    if (e != cudaSuccess) {
+        printf("Error from CUDA: %s\n", cudaGetErrorString(e));
+        return -1.0;
+    }
+    sum_kernel<<<blocks, threads>>>(ptr, d_block_sums, n);
+    cudaDeviceSynchronize();
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("Error from CUDA: %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+
+    float *host_array = (float*)malloc(blocks * sizeof(float));
+    cudaMemcpy(host_array, d_block_sums, blocks * sizeof(float), cudaMemcpyDeviceToHost);
+    double sum = 0.0;
+    for (int i = 0; i < blocks; i++) sum += host_array[i];
+    free(host_array);
+    cudaFree(d_block_sums);
+    return sum; 
+    
+}
 int main(int argc, char **argv) {
     if (argc < 2) {
         printf("Usage: %s <weights.bin>\n", argv[0]);
@@ -123,7 +178,12 @@ int main(int argc, char **argv) {
 
     printf("Load Success\n");
     printf("WTE at offset 0, ln_f_b at %td floats \n", m.ln_f_b - m.all);
-
+    // Copy back & check method on wte and ln_f_b
+    peek("wte", m.wte, 3);
+    peek("ln_f_b", m.ln_f_b, 3);
+    size_t wte_n = (size_t)m.vocab_size * m.d_model;
+    double s = sum_on_gpu(m.wte, wte_n);
+    printf("WTE Sum: %.6f (comparing against python's checksum which is =14659.962891=)\n", s);
     model_free(&m);
     return 0;
 }
