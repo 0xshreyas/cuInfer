@@ -110,6 +110,35 @@ __global__ void softmax_kernel(float *x, int n_rows, int row_len) {
     for (int i = tid; i < row_len; i += blockDim.x) row[i] /= total;
 }
 
+__global__ void matmul_kernel(const float *A, const float *B, const float *bias, float *C, int M, int N, int K) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    if (row < M && col < N) {
+        float sum = 0.0f;
+        for (int k = 0; k < K; k++) {
+            sum += A[row * K + k] * B[k * N + col];
+        }
+        C[row * N + col] = sum + (bias ? bias[col] : 0.0f);
+    }
+}
+
+__global__ void add_kernel(float *x, const float *y, size_t n) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        x[i] += y[i];
+    }
+}
+
+__global__ void embed_kernel(const int *tokens, const float *wte, const float *wpe, float *out, int T, int d) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < T * d) {
+        int t = i / d;
+        int col = i % d;
+        out[i] = wte[(size_t)tokens[t] * d + col] + wpe[(size_t)t * d + col];
+    }
+}
+
+
 // Structure for the loader includes the 12 tensors in a layer and parameters of a model
 typedef struct {
     float *ln_1_w, *ln_1_b;
@@ -427,6 +456,72 @@ void softmax_test() {
     free(h_ref);
     cudaFree(d_x);
 }
+
+void mlp_forward(Layer *L, float *x, float *hidden, float *out, int T, int d) {
+    dim3 tpb(16, 16);
+    
+    dim3 g1((4*d + 15)/16, (T + 15)/16);
+    matmul_kernel<<<g1, tpb>>>(x, L->fc_w, L->fc_b, hidden, T, 4*d, d);
+
+    size_t hn = (size_t)T * 4 * d;
+    gelu_kernel<<<(hn + 255)/256, 256>>>(hidden, hidden, hn);
+
+    dim3 g2((d + 15)/16, (T + 15)/16);
+    matmul_kernel<<<g2, tpb>>>(hidden, L->fcproj_w, L->fcproj_b, out, T, d, 4*d);
+}
+
+void test_embed(Model *m) {
+    int T = 5, d = 768;
+    size_t n = (size_t)T * d;
+    int h_tokens[5];
+    FILE *f = fopen("../export/oracle_tokens.bin", "rb");
+    if (!f) {
+        printf("Could not open oracle_tokens.bin\n");
+        return;
+    }
+    if(fread(h_tokens, sizeof(int), T, f) != (size_t)T) {
+        printf("Short read on oracle_tokens.bin\n");
+        fclose(f);
+        return;
+    }
+    fclose(f);
+    float *h_ref = (float*)malloc(n * sizeof(float));
+    f = fopen("../export/oracle_embed.bin", "rb");
+    if (!f) {
+        printf("could not open oracle_embed.bin\n");
+        return;
+    }
+    if(fread(h_ref, sizeof(float), n, f) != n) {
+        printf("Short read on oracle_embed.bin\n");
+        fclose(f);
+        free(h_ref);
+        return;
+    }
+    fclose(f);
+
+    int *d_tokens;
+    float *d_out;
+    cudaMalloc(&d_tokens, T * sizeof(int));
+    cudaMalloc(&d_out, n * sizeof(float));
+    cudaMemcpy(d_tokens, h_tokens, T * sizeof(int), cudaMemcpyHostToDevice);
+    embed_kernel<<<(n + 255)/256, 256>>>(d_tokens, m->wte, m->wpe, d_out, T, d);
+    cudaDeviceSynchronize();
+
+    float *h_out = (float*)malloc(n * sizeof(float));
+    cudaMemcpy(h_out, d_out, n * sizeof(float), cudaMemcpyDeviceToHost);
+
+    float maxDiff = 0.0f;
+    for (size_t i = 0; i < n; i++) {
+        float df = fabsf(h_out[i] - h_ref[i]);
+        if (df > maxDiff) maxDiff = df;
+    }
+
+    printf("Embed Difference: %.3e %s\n", maxDiff, maxDiff < 1e-4 ? "PASS" : "FAIL");
+    free(h_ref);
+    free(h_out);
+    cudaFree(d_tokens);
+    cudaFree(d_out);    
+}
 int main(int argc, char **argv) {
     if (argc < 2) {
         printf("Usage: %s <weights.bin>\n", argv[0]);
@@ -450,6 +545,7 @@ int main(int argc, char **argv) {
     test_gelu();
     test_layernorm();
     softmax_test();
+    test_embed(&m);
     model_free(&m);
     return 0;
 }
