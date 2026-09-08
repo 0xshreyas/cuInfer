@@ -138,6 +138,22 @@ __global__ void embed_kernel(const int *tokens, const float *wte, const float *w
     }
 }
 
+__global__ void scores_kernel(const float *qkv, float *scores, int T, int n_head, int head_dim) {
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_head * T * T) return;
+    int h = idx / (T * T);
+    int i = (idx / T) % T;
+    int j = (idx % T);
+
+    int d3 = 3 * n_head * head_dim;
+    const float *q = qkv + (size_t)i * d3 + 0 + h * head_dim;
+    const float *k = qkv + (size_t)j * d3 + n_head * head_dim + h * head_dim;
+
+    float sum = 0.0f;
+    for (int e = 0; e < head_dim; e++) sum+= q[e] * k[e];
+    scores[(size_t)h * T * T + i * T + j] = sum * rsqrtf((float)head_dim);
+}
 
 // Structure for the loader includes the 12 tensors in a layer and parameters of a model
 typedef struct {
@@ -522,6 +538,54 @@ void test_embed(Model *m) {
     cudaFree(d_tokens);
     cudaFree(d_out);    
 }
+
+void test_scores() {
+    size_t n = 5 * 2304;
+    float *h_qkv = (float*)malloc(n * sizeof(float));
+    for (size_t i = 0; i < n; i++) h_qkv[i] = (rand() % 2000 - 1000) / 100.0f;
+    float *d_qkv;
+    cudaMalloc(&d_qkv, n * sizeof(float));
+    cudaMemcpy(d_qkv, h_qkv, n * sizeof(float), cudaMemcpyHostToDevice);
+
+    size_t out_n = (size_t)12 * 5 * 5;
+    float *d_scores;
+    cudaMalloc(&d_scores, out_n * sizeof(float));
+
+    scores_kernel<<<(out_n + 255)/256, 256>>>(d_qkv, d_scores, 5, 12, 64);
+    cudaDeviceSynchronize();
+
+    float *h_out = (float*)malloc(out_n * sizeof(float));
+    cudaMemcpy(h_out, d_scores, out_n * sizeof(float), cudaMemcpyDeviceToHost);
+
+    float *h_ref = (float*)malloc(out_n * sizeof(float));
+    int T = 5, n_head = 12, head_dim = 64, d3 = 3 * n_head * head_dim;
+    for (int h = 0; h < n_head; h++) {
+        for (int i = 0; i < T; i++) {
+            for (int j = 0; j < T; j++) {
+                const float *q = h_qkv + (size_t)i * d3 + h * head_dim;
+                const float *k = h_qkv + (size_t)j * d3 + n_head * head_dim + h * head_dim;
+
+                float sum = 0.0f;
+                for (int e = 0; e < head_dim; e++) sum+= q[e] * k[e];
+                h_ref[h * T * T + i * T + j] = sum / sqrtf((float)head_dim);
+            }
+        }
+    }
+
+    float maxDiff = 0.0f;
+    for (size_t i = 0; i < out_n; i++) {
+        float df = fabsf(h_out[i] - h_ref[i]);
+        if (df > maxDiff) maxDiff = df;
+    }
+
+    printf("Scores Difference: %.3e %s\n", maxDiff, maxDiff < 1e-4 ? "PASS" : "FAIL");
+    cudaFree(d_qkv);
+    cudaFree(d_scores);
+    free(h_qkv);
+    free(h_ref);
+    free(h_out);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         printf("Usage: %s <weights.bin>\n", argv[0]);
@@ -546,6 +610,7 @@ int main(int argc, char **argv) {
     test_layernorm();
     softmax_test();
     test_embed(&m);
+    test_scores();
     model_free(&m);
     return 0;
 }
