@@ -155,6 +155,31 @@ __global__ void scores_kernel(const float *qkv, float *scores, int T, int n_head
     scores[(size_t)h * T * T + i * T + j] = sum * rsqrtf((float)head_dim);
 }
 
+__global__ void mask_kernel(float *scores, int T, int n_head) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_head * T * T) return;
+
+    int h = idx / (T * T);
+    int i = (idx / T) % T;
+    int j = (idx % T);
+
+    if (j > i) scores[(size_t)h * T * T + i * T + j] = -INFINITY;
+}
+
+__global__ void weighted_v_kernel(const float *weights, const float *qkv, float *out, int T, int n_head, int head_dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= T * n_head * head_dim) return;
+    int t = idx / (n_head * head_dim);
+    int h = (idx / head_dim) % n_head;
+    int e = (idx % head_dim);
+
+    float sum = 0.0f;
+    int d3 = 3 * n_head * head_dim;
+    for (int j = 0; j < T; j++) {
+        sum += weights[h * T * T + t * T + j] * qkv[j * d3 + 2 * n_head * head_dim + h * head_dim + e];
+    }
+    out[t * n_head * head_dim + h * head_dim + e] = sum;
+}
 // Structure for the loader includes the 12 tensors in a layer and parameters of a model
 typedef struct {
     float *ln_1_w, *ln_1_b;
@@ -584,6 +609,44 @@ void test_scores() {
     free(h_qkv);
     free(h_ref);
     free(h_out);
+}
+
+void attention_forward(Layer *L, float *x, float *qkv, float *scores, float *attn_out, float *out, int T, int d, int n_head) {
+    int head_dim = d / n_head;
+    dim3 tpb(16, 16);
+
+    // QKV Projection: (T,d) @ (d,3d) -> (T,3d)
+    dim3 g1((3 * d + 15)/16, (T + 15)/16);
+    matmul_kernel<<<g1, tpb>>>(x, L->attn_w, L->attn_b, qkv, T, 3 * d, d);
+
+    // Scores
+    int n_scores = n_head * T * T;
+    scores_kernel<<<(n_scores + 255)/256, 256>>>(qkv, scores, T, n_head, head_dim);
+
+    // Casual Mask
+    mask_kernel<<<(n_scores + 255)/256, 256>>>(scores, T, n_head);
+
+    // Softmax over each row of length T
+    softmax_kernel<<<n_head * T, 256>>>(scores, n_head * T, T);
+
+    // Weighted V
+    int n_out = T * d;
+    weighted_v_kernel<<<(n_out + 255)/256, 256>>>(scores, qkv, attn_out, T, n_head, head_dim);
+
+    // Output Projection (T,d) @ (d,d) -> (T,d)
+    dim3 g2((d + 15)/16, (T + 15)/16);
+    matmul_kernel<<<g2, tpb>>>(attn_out, L->proj_w, L->proj_b, out, T, d, d);
+}
+
+void block_forward(Layer *L, float *x, float *ln_out, float *qkv, float *scores, float *attn_out, float *hidden, float *tmp, int T, int d, int n_head) {
+    size_t n = (size_t)T * d;
+    int blocks = (n + 255) / 256;
+    layerNorm_kernel<<<T, 256>>>(x, ln_out, L->ln_1_w, L->ln_1_b, T, d);
+    attention_forward(L, ln_out, qkv, scores, attn_out, tmp, T, d, n_head);
+    add_kernel<<<blocks, 256>>>(x, tmp, n);
+    layerNorm_kernel<<<T, 256>>>(x, ln_out, L->ln_2_w, L->ln_2_b, T, d);
+    mlp_forward(L, ln_out, hidden, tmp, T, d);
+    add_kernel<<<blocks, 256>>>(x, tmp, n);
 }
 
 int main(int argc, char **argv) {
