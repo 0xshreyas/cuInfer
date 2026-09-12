@@ -1,6 +1,23 @@
 #include<stdio.h>
 #include<stdlib.h>
 #include<math.h>
+
+// #define CHECK(call) do { \
+//     cudaError_t _e = (call); \
+//     if (_e != cudaSuccess) { \
+//         printf("CUDA error at line %d: %s\n", __LINE__, cudaGetErrorString(_e)); \
+//         return; \
+//     } \
+// } while(0)
+
+#define CHECK(call) do { \
+    cudaError_t _e = (call); \
+    if (_e != cudaSuccess) { \
+        printf("CUDA Error at line: %d: %s\n", __LINE__, cudaGetErrorString(_e)); \
+        return; \
+    } \
+} while(0)
+
 #define MAGIC 0x63754C4D
 
 __global__ void gelu_kernel(const float *in, float *out, size_t n) {
@@ -649,6 +666,74 @@ void block_forward(Layer *L, float *x, float *ln_out, float *qkv, float *scores,
     add_kernel<<<blocks, 256>>>(x, tmp, n);
 }
 
+void test_block(Model *m) {
+    float *embed_buffer = (float*)malloc(3840 * sizeof(float));
+    FILE *embed_f = fopen("../export/oracle_embed.bin", "rb");
+    if (!embed_f) {printf("Could not open oracle_embed.bin\n"); return;}
+    if (fread(embed_buffer, sizeof(float), 3840, embed_f) != 3840) {
+        printf("Short Read\n"); fclose(embed_f); return;
+    }
+    fclose(embed_f);
+    
+    float *layer0_buffer = (float*)malloc(3840 * sizeof(float));
+    FILE *layer_f = fopen("../export/oracle_layer00.bin", "rb");
+    if (!layer_f) {printf("Could not open oracle_layer00.bin\n"); return;}
+    if (fread(layer0_buffer, sizeof(float), 3840, layer_f) != 3840) {
+        printf("Short Read\n"); fclose(layer_f); return;
+    }
+    fclose(layer_f);
+    
+    float *x, *ln_out, *qkv, *scores, *attn_out, *hidden, *tmp;
+    CHECK(cudaMalloc(&x, 3840 * sizeof(float)));
+    CHECK(cudaMalloc(&ln_out, 3840 * sizeof(float)));
+    CHECK(cudaMalloc(&qkv, 11520 * sizeof(float)));
+    CHECK(cudaMalloc(&scores, 300 * sizeof(float)));
+    CHECK(cudaMalloc(&attn_out, 3840 * sizeof(float)));
+    CHECK(cudaMalloc(&hidden, 15360 * sizeof(float)));
+    CHECK(cudaMalloc(&tmp, 3840 * sizeof(float)));
+    CHECK(cudaMemcpy(x, embed_buffer, 3840 * sizeof(float), cudaMemcpyHostToDevice));
+
+    for (int layer = 0; layer < 12; layer++) {
+        block_forward(&m->layers[layer], x, ln_out, qkv, scores, attn_out, hidden, tmp, 5, 768, 12);
+        CHECK(cudaDeviceSynchronize());
+
+        char path[126];
+        sprintf(path, "../export/oracle_layer%02d.bin", layer);
+        FILE *lf = fopen(path, "rb");
+        fread(layer0_buffer, sizeof(float), 3840, lf);
+        fclose(lf);
+
+        CHECK(cudaMemcpy(embed_buffer, x, 3840 * sizeof(float), cudaMemcpyDeviceToHost));
+        
+        float maxDiff = 0.0f;
+        float maxRel  = 0.0f;
+        float maxVal  = 0.0f;
+        for (size_t i = 0; i < 3840; i++) {
+            float d = fabsf(embed_buffer[i] - layer0_buffer[i]);
+            if (d > maxDiff) maxDiff = d;
+
+            float den = fabsf(layer0_buffer[i]) + 1e-3f;
+            float r = d / den;
+            if (r > maxRel) maxRel = r;
+
+            if (fabsf(layer0_buffer[i]) > maxVal) maxVal = fabsf(layer0_buffer[i]);
+        }
+        printf("layer %2d: abs %.3e  rel %.3e  max|ref| %.2f  %s\n",
+               layer, maxDiff, maxRel, maxVal,
+               maxRel < 1e-2 ? "PASS" : "FAIL");
+    }
+    CHECK(cudaGetLastError());
+    cudaFree(x);
+    cudaFree(ln_out);
+    cudaFree(qkv);
+    cudaFree(scores);
+    cudaFree(attn_out);
+    cudaFree(hidden);
+    cudaFree(tmp);
+    free(embed_buffer);
+    free(layer0_buffer);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         printf("Usage: %s <weights.bin>\n", argv[0]);
@@ -674,6 +759,7 @@ int main(int argc, char **argv) {
     softmax_test();
     test_embed(&m);
     test_scores();
+    test_block(&m);
     model_free(&m);
     return 0;
 }
