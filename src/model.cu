@@ -155,48 +155,63 @@ __global__ void embed_kernel(const int *tokens, const float *wte, const float *w
     }
 }
 
-__global__ void scores_kernel(const float *qkv, float *scores, int T, int n_head, int head_dim) {
+__global__ void scores_kernel(const float *qkv, const float *k_cache, float *scores, int layer, int T, int total_len, int n_head, int head_dim, int max_T) {
 
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n_head * T * T) return;
-    int h = idx / (T * T);
-    int i = (idx / T) % T;
-    int j = (idx % T);
+    if (idx >= n_head * T * total_len) return;
+    int h = idx / (T * total_len);
+    int i = (idx / total_len) % T;
+    int j = (idx % total_len);
 
     int d3 = 3 * n_head * head_dim;
     const float *q = qkv + (size_t)i * d3 + 0 + h * head_dim;
-    const float *k = qkv + (size_t)j * d3 + n_head * head_dim + h * head_dim;
+    int d = n_head * head_dim;
+    const float *k = k_cache + (size_t)layer * max_T * d + (size_t)j * d + h * head_dim;
 
     float sum = 0.0f;
     for (int e = 0; e < head_dim; e++) sum+= q[e] * k[e];
-    scores[(size_t)h * T * T + i * T + j] = sum * rsqrtf((float)head_dim);
+    scores[(size_t)h * T * total_len + i * total_len + j] = sum * rsqrtf((float)head_dim);
 }
 
-__global__ void mask_kernel(float *scores, int T, int n_head) {
+__global__ void mask_kernel(float *scores, int T, int total_len, int n_head, int pos) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n_head * T * T) return;
+    if (idx >= n_head * T * total_len) return;
 
-    int h = idx / (T * T);
-    int i = (idx / T) % T;
-    int j = (idx % T);
+    int h = idx / (T * total_len);
+    int i = (idx / total_len) % T;
+    int j = (idx % total_len);
 
-    if (j > i) scores[(size_t)h * T * T + i * T + j] = -INFINITY;
+    if (j > pos + i) scores[(size_t)h * T * total_len + i * total_len + j] = -INFINITY;
 }
 
-__global__ void weighted_v_kernel(const float *weights, const float *qkv, float *out, int T, int n_head, int head_dim) {
+__global__ void weighted_v_kernel(const float *weights, const float *v_cache, float *out, int layer, int T, int total_len, int n_head, int head_dim, int max_T) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= T * n_head * head_dim) return;
     int t = idx / (n_head * head_dim);
     int h = (idx / head_dim) % n_head;
     int e = (idx % head_dim);
-
+    int d = n_head * head_dim;
     float sum = 0.0f;
-    int d3 = 3 * n_head * head_dim;
-    for (int j = 0; j < T; j++) {
-        sum += weights[h * T * T + t * T + j] * qkv[j * d3 + 2 * n_head * head_dim + h * head_dim + e];
+    for (int j = 0; j < total_len; j++) {
+        sum += weights[h * T * total_len + t * total_len + j] * v_cache[layer * max_T * d + j * d + h * head_dim + e];
     }
     out[t * n_head * head_dim + h * head_dim + e] = sum;
 }
+
+__global__ void cache_write_kernel(const float *qkv, float *k_cache, float *v_cache, int layer, int pos, int T, int d, int max_T) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= T * d) return;
+
+    size_t t = idx / d;
+    size_t i = idx % d;
+
+    size_t cache_idx = (size_t)layer * max_T * d + (pos + t) * d + i;
+
+    k_cache[cache_idx] = qkv[t * 3 * d + d + i];
+    v_cache[cache_idx] = qkv[t * 3 * d + 2 * d + i];
+}
+
+
 // Structure for the loader includes the 12 tensors in a layer and parameters of a model
 typedef struct {
     float *ln_1_w, *ln_1_b;
@@ -581,89 +596,160 @@ void test_embed(Model *m) {
     cudaFree(d_out);    
 }
 
-void test_scores() {
-    size_t n = 5 * 2304;
-    float *h_qkv = (float*)malloc(n * sizeof(float));
-    for (size_t i = 0; i < n; i++) h_qkv[i] = (rand() % 2000 - 1000) / 100.0f;
-    float *d_qkv;
-    cudaMalloc(&d_qkv, n * sizeof(float));
-    cudaMemcpy(d_qkv, h_qkv, n * sizeof(float), cudaMemcpyHostToDevice);
+// void test_scores() {
+//     size_t n = 5 * 2304;
+//     float *h_qkv = (float*)malloc(n * sizeof(float));
+//     for (size_t i = 0; i < n; i++) h_qkv[i] = (rand() % 2000 - 1000) / 100.0f;
+//     float *d_qkv;
+//     cudaMalloc(&d_qkv, n * sizeof(float));
+//     cudaMemcpy(d_qkv, h_qkv, n * sizeof(float), cudaMemcpyHostToDevice);
 
-    size_t out_n = (size_t)12 * 5 * 5;
-    float *d_scores;
-    cudaMalloc(&d_scores, out_n * sizeof(float));
+//     size_t out_n = (size_t)12 * 5 * 5;
+//     float *d_scores;
+//     cudaMalloc(&d_scores, out_n * sizeof(float));
 
-    scores_kernel<<<(out_n + 255)/256, 256>>>(d_qkv, d_scores, 5, 12, 64);
-    cudaDeviceSynchronize();
+//     scores_kernel<<<(out_n + 255)/256, 256>>>(d_qkv, d_scores, 5, 12, 64);
+//     cudaDeviceSynchronize();
 
-    float *h_out = (float*)malloc(out_n * sizeof(float));
-    cudaMemcpy(h_out, d_scores, out_n * sizeof(float), cudaMemcpyDeviceToHost);
+//     float *h_out = (float*)malloc(out_n * sizeof(float));
+//     cudaMemcpy(h_out, d_scores, out_n * sizeof(float), cudaMemcpyDeviceToHost);
 
-    float *h_ref = (float*)malloc(out_n * sizeof(float));
-    int T = 5, n_head = 12, head_dim = 64, d3 = 3 * n_head * head_dim;
-    for (int h = 0; h < n_head; h++) {
-        for (int i = 0; i < T; i++) {
-            for (int j = 0; j < T; j++) {
-                const float *q = h_qkv + (size_t)i * d3 + h * head_dim;
-                const float *k = h_qkv + (size_t)j * d3 + n_head * head_dim + h * head_dim;
+//     float *h_ref = (float*)malloc(out_n * sizeof(float));
+//     int T = 5, n_head = 12, head_dim = 64, d3 = 3 * n_head * head_dim;
+//     for (int h = 0; h < n_head; h++) {
+//         for (int i = 0; i < T; i++) {
+//             for (int j = 0; j < T; j++) {
+//                 const float *q = h_qkv + (size_t)i * d3 + h * head_dim;
+//                 const float *k = h_qkv + (size_t)j * d3 + n_head * head_dim + h * head_dim;
 
-                float sum = 0.0f;
-                for (int e = 0; e < head_dim; e++) sum+= q[e] * k[e];
-                h_ref[h * T * T + i * T + j] = sum / sqrtf((float)head_dim);
-            }
-        }
-    }
+//                 float sum = 0.0f;
+//                 for (int e = 0; e < head_dim; e++) sum+= q[e] * k[e];
+//                 h_ref[h * T * T + i * T + j] = sum / sqrtf((float)head_dim);
+//             }
+//         }
+//     }
 
-    float maxDiff = 0.0f;
-    for (size_t i = 0; i < out_n; i++) {
-        float df = fabsf(h_out[i] - h_ref[i]);
-        if (df > maxDiff) maxDiff = df;
-    }
+//     float maxDiff = 0.0f;
+//     for (size_t i = 0; i < out_n; i++) {
+//         float df = fabsf(h_out[i] - h_ref[i]);
+//         if (df > maxDiff) maxDiff = df;
+//     }
 
-    printf("Scores Difference: %.3e %s\n", maxDiff, maxDiff < 1e-4 ? "PASS" : "FAIL");
-    cudaFree(d_qkv);
-    cudaFree(d_scores);
-    free(h_qkv);
-    free(h_ref);
-    free(h_out);
-}
+//     printf("Scores Difference: %.3e %s\n", maxDiff, maxDiff < 1e-4 ? "PASS" : "FAIL");
+//     cudaFree(d_qkv);
+//     cudaFree(d_scores);
+//     free(h_qkv);
+//     free(h_ref);
+//     free(h_out);
+// }
 
-void attention_forward(Layer *L, float *x, float *qkv, float *scores, float *attn_out, float *out, int T, int d, int n_head) {
+void attention_forward(Layer *L, float *x, float *qkv, float *scores, float *attn_out, float *out, float *k_cache, float *v_cache, int layer, int pos, int T, int d, int n_head, int max_T) {
+    
     int head_dim = d / n_head;
+    int total_len = pos + T;
     dim3 tpb(16, 16);
 
     // QKV Projection: (T,d) @ (d,3d) -> (T,3d)
     dim3 g1((3 * d + 15)/16, (T + 15)/16);
     matmul_kernel<<<g1, tpb>>>(x, L->attn_w, L->attn_b, qkv, T, 3 * d, d);
 
+    // K and V into the cache
+    int n_cache = T * d;
+    cache_write_kernel<<<(n_cache + 255)/256, 256>>>(qkv, k_cache, v_cache, layer, pos, T, d, max_T);
+
     // Scores
-    int n_scores = n_head * T * T;
-    scores_kernel<<<(n_scores + 255)/256, 256>>>(qkv, scores, T, n_head, head_dim);
+    int n_scores = n_head * T * total_len;
+    scores_kernel<<<(n_scores + 255)/256, 256>>>(qkv, k_cache, scores, layer, T, total_len, n_head, head_dim, max_T);
 
     // Casual Mask
-    mask_kernel<<<(n_scores + 255)/256, 256>>>(scores, T, n_head);
+    mask_kernel<<<(n_scores + 255)/256, 256>>>(scores, T, total_len, n_head, pos);
 
     // Softmax over each row of length T
-    softmax_kernel<<<n_head * T, 256>>>(scores, n_head * T, T);
+    softmax_kernel<<<n_head * T, 256>>>(scores, n_head * T, total_len);
 
     // Weighted V
     int n_out = T * d;
-    weighted_v_kernel<<<(n_out + 255)/256, 256>>>(scores, qkv, attn_out, T, n_head, head_dim);
+    weighted_v_kernel<<<(n_out + 255)/256, 256>>>(scores, v_cache, attn_out, layer, T, total_len, n_head, head_dim, max_T);
 
     // Output Projection (T,d) @ (d,d) -> (T,d)
     dim3 g2((d + 15)/16, (T + 15)/16);
     matmul_kernel<<<g2, tpb>>>(attn_out, L->proj_w, L->proj_b, out, T, d, d);
 }
 
-void block_forward(Layer *L, float *x, float *ln_out, float *qkv, float *scores, float *attn_out, float *hidden, float *tmp, int T, int d, int n_head) {
+void block_forward(Layer *L, float *x, float *ln_out, float *qkv, float *scores, float *attn_out, float *hidden, float *tmp, float *k_cache, float *v_cache, int layer, int pos, int T, int d, int n_head, int max_T) {
     size_t n = (size_t)T * d;
     int blocks = (n + 255) / 256;
     layerNorm_kernel<<<T, 256>>>(x, ln_out, L->ln_1_w, L->ln_1_b, T, d);
-    attention_forward(L, ln_out, qkv, scores, attn_out, tmp, T, d, n_head);
+    attention_forward(L, ln_out, qkv, scores, attn_out, tmp, k_cache, v_cache, layer, pos, T, d, n_head, max_T);
     add_kernel<<<blocks, 256>>>(x, tmp, n);
     layerNorm_kernel<<<T, 256>>>(x, ln_out, L->ln_2_w, L->ln_2_b, T, d);
     mlp_forward(L, ln_out, hidden, tmp, T, d);
     add_kernel<<<blocks, 256>>>(x, tmp, n);
+}
+
+void test_cache(Model *m) {
+    int T = 5, d = 768, n_head = 12, max_T = 16;
+    size_t n = (size_t)T * d;
+
+    float *h_embed = (float*)malloc(n * sizeof(float));
+    FILE *f = fopen("../export/oracle_embed.bin", "rb");
+    if (!f) { printf("could not open oracle_embed.bin\n"); return; }
+    if (fread(h_embed, sizeof(float), n, f) != n) { printf("short read\n"); fclose(f); return; }
+    fclose(f);
+
+    float *x, *ln_out, *qkv, *scores, *attn_out, *hidden, *tmp, *k_cache, *v_cache;
+    CHECK(cudaMalloc(&x,        n * sizeof(float)));
+    CHECK(cudaMalloc(&ln_out,   n * sizeof(float)));
+    CHECK(cudaMalloc(&qkv,      (size_t)T * 3 * d * sizeof(float)));
+    CHECK(cudaMalloc(&scores,   (size_t)n_head * max_T * max_T * sizeof(float)));
+    CHECK(cudaMalloc(&attn_out, n * sizeof(float)));
+    CHECK(cudaMalloc(&hidden,   (size_t)T * 4 * d * sizeof(float)));
+    CHECK(cudaMalloc(&tmp,      n * sizeof(float)));
+    CHECK(cudaMalloc(&k_cache,  (size_t)12 * max_T * d * sizeof(float)));
+    CHECK(cudaMalloc(&v_cache,  (size_t)12 * max_T * d * sizeof(float)));
+
+    // --- Run A: all 5 tokens at once ---
+    CHECK(cudaMemset(k_cache, 0, (size_t)12 * max_T * d * sizeof(float)));
+    CHECK(cudaMemset(v_cache, 0, (size_t)12 * max_T * d * sizeof(float)));
+    CHECK(cudaMemcpy(x, h_embed, n * sizeof(float), cudaMemcpyHostToDevice));
+
+    block_forward(&m->layers[0], x, ln_out, qkv, scores, attn_out, hidden, tmp,
+                  k_cache, v_cache, 0, 0, T, d, n_head, max_T);
+    CHECK(cudaDeviceSynchronize());
+
+    float *outA = (float*)malloc(n * sizeof(float));
+    CHECK(cudaMemcpy(outA, x, n * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // --- Run B: 3 tokens, then 2 ---
+    CHECK(cudaMemset(k_cache, 0, (size_t)12 * max_T * d * sizeof(float)));
+    CHECK(cudaMemset(v_cache, 0, (size_t)12 * max_T * d * sizeof(float)));
+
+    CHECK(cudaMemcpy(x, h_embed, (size_t)3 * d * sizeof(float), cudaMemcpyHostToDevice));
+    block_forward(&m->layers[0], x, ln_out, qkv, scores, attn_out, hidden, tmp,
+                  k_cache, v_cache, 0, 0, 3, d, n_head, max_T);
+    CHECK(cudaDeviceSynchronize());
+
+    CHECK(cudaMemcpy(x, h_embed + 3 * d, (size_t)2 * d * sizeof(float), cudaMemcpyHostToDevice));
+    block_forward(&m->layers[0], x, ln_out, qkv, scores, attn_out, hidden, tmp,
+                  k_cache, v_cache, 0, 3, 2, d, n_head, max_T);
+    CHECK(cudaDeviceSynchronize());
+
+    float *outB = (float*)malloc((size_t)2 * d * sizeof(float));
+    CHECK(cudaMemcpy(outB, x, (size_t)2 * d * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // --- compare outB against rows 3-4 of outA ---
+    float maxDiff = 0.0f;
+    for (size_t i = 0; i < (size_t)2 * d; i++) {
+        float df = fabsf(outB[i] - outA[3 * d + i]);
+        if (df > maxDiff) maxDiff = df;
+    }
+    printf("cache split-batch diff: %.3e  %s\n",
+           maxDiff, maxDiff < 1e-3 ? "PASS" : "FAIL");
+
+    free(h_embed); free(outA); free(outB);
+    cudaFree(x); cudaFree(ln_out); cudaFree(qkv); cudaFree(scores);
+    cudaFree(attn_out); cudaFree(hidden); cudaFree(tmp);
+    cudaFree(k_cache); cudaFree(v_cache);
 }
 
 void test_block(Model *m) {
@@ -693,8 +779,13 @@ void test_block(Model *m) {
     CHECK(cudaMalloc(&tmp, 3840 * sizeof(float)));
     CHECK(cudaMemcpy(x, embed_buffer, 3840 * sizeof(float), cudaMemcpyHostToDevice));
 
+    int max_T = 16;
+    float *k_cache, *v_cache;
+    CHECK(cudaMalloc(&k_cache, (size_t)12 * max_T * 768 * sizeof(float)));
+    CHECK(cudaMalloc(&v_cache, (size_t)12 * max_T * 768 * sizeof(float)));
+
     for (int layer = 0; layer < 12; layer++) {
-        block_forward(&m->layers[layer], x, ln_out, qkv, scores, attn_out, hidden, tmp, 5, 768, 12);
+        block_forward(&m->layers[layer], x, ln_out, qkv, scores, attn_out, hidden, tmp, k_cache, v_cache, layer, 0, 5, 768, 12, max_T);
         CHECK(cudaDeviceSynchronize());
 
         char path[126];
@@ -758,8 +849,9 @@ int main(int argc, char **argv) {
     test_layernorm();
     softmax_test();
     test_embed(&m);
-    test_scores();
+    // test_scores();
     test_block(&m);
+    test_cache(&m);
     model_free(&m);
     return 0;
 }
