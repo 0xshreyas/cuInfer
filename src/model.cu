@@ -2,20 +2,21 @@
 #include<stdlib.h>
 #include<math.h>
 
-// #define CHECK(call) do { \
-//     cudaError_t _e = (call); \
-//     if (_e != cudaSuccess) { \
-//         printf("CUDA error at line %d: %s\n", __LINE__, cudaGetErrorString(_e)); \
-//         return; \
-//     } \
-// } while(0)
-
 #define CHECK(call) do { \
     cudaError_t _e = (call); \
     if (_e != cudaSuccess) { \
         printf("CUDA Error at line: %d: %s\n", __LINE__, cudaGetErrorString(_e)); \
         return; \
     } \
+} while(0)
+
+#define TIME_BLOCK(acc, ...) do {                   \
+    cudaEventRecord(_s);                            \
+    __VA_ARGS__;                                    \
+    cudaEventRecord(_e);                            \
+    cudaEventSynchronize(_e);                       \
+    float _ms; cudaEventElapsedTime(&_ms, _s, _e);  \
+    (acc) += _ms;                                   \
 } while(0)
 
 #define MAGIC 0x63754C4D
@@ -238,11 +239,15 @@ typedef struct {
     float *wte_T;
 } Model;
 
+typedef struct {
+    float embed, layernorm, qkv, attn, attn_proj, mlp, logits;
+} Timings;
+
 static float *TAKE(Model *m, size_t *off, size_t n) {
-        float *p = m->all + *off;
-        *off += n;
-        return p;
-    }
+    float *p = m->all + *off;
+    *off += n;
+    return p;
+}
 
 int model_load(Model *m, const char *path) {
     FILE *f = fopen(path, "rb");
@@ -954,6 +959,120 @@ void test_forward(Model *m) {
     cudaFree(tmp); cudaFree(k_cache); cudaFree(v_cache);
 }
 
+void forward_pass_profiled(Model *m, const int *d_tokens, float *logits, float *x, float *ln_out, float *qkv, float *scores, float *attn_out, float *hidden, float *tmp, float *k_cache, float *v_cache, int pos, int T, int max_T, Timings *t) {
+    int d = m->d_model, n_head = m->n_head, head_dim = d / n_head;
+    int total_len = pos + T;
+    size_t n = (size_t)T * d;
+    int blocks = (n + 255) / 256;
+    dim3 tpb(16, 16);
+
+    cudaEvent_t _s, _e;
+    cudaEventCreate(&_s); cudaEventCreate(&_e);
+
+    TIME_BLOCK(t->embed, embed_kernel<<<(n + 255)/256, 256>>>(d_tokens, m->wte, m->wpe, x, T, d, pos););
+
+    for (int layer = 0; layer < m->n_layer; layer++) {
+        Layer *L = &m->layers[layer];
+
+        TIME_BLOCK(t->layernorm, layerNorm_kernel<<<T, 256>>>(x, ln_out, L->ln_1_w, L->ln_1_b, T, d););
+
+        dim3 g1((3 * d + 15)/16, (T + 15)/16);
+        TIME_BLOCK(t->qkv, matmul_kernel<<<g1, tpb>>>(ln_out, L->attn_w, L->attn_b, qkv, T, 3*d, d););
+
+        int n_scores = n_head * T * total_len;
+        TIME_BLOCK(t->attn, cache_write_kernel<<<(T*d + 255)/256, 256>>>(qkv, k_cache, v_cache, layer, pos, T, d, max_T); scores_kernel<<<(n_scores + 255)/256, 256>>>(qkv, k_cache, scores, layer, T, total_len, n_head, head_dim, max_T); mask_kernel<<<(n_scores + 255)/256, 256>>>(scores, T, total_len, n_head, pos); softmax_kernel<<<n_head * T, 256>>>(scores, n_head * T, total_len); weighted_v_kernel<<<(T*d + 255)/256, 256>>>(scores, v_cache, attn_out, layer, T, total_len, n_head, head_dim, max_T););
+
+        dim3 g2((d + 15)/16, (T + 15)/16);
+        TIME_BLOCK(t->attn_proj, matmul_kernel<<<g2, tpb>>>(attn_out, L->proj_w, L->proj_b, tmp, T, d, d););
+
+        add_kernel<<<blocks, 256>>>(x, tmp, n);
+
+        TIME_BLOCK(t->layernorm, layerNorm_kernel<<<T, 256>>>(x, ln_out, L->ln_2_w, L->ln_2_b, T, d););
+
+        dim3 g3((4*d + 15)/16, (T + 15)/16);
+        dim3 g4((d + 15)/16, (T + 15)/16);
+        size_t hn = (size_t)T * 4 * d;
+        TIME_BLOCK(t->mlp, matmul_kernel<<<g3, tpb>>>(ln_out, L->fc_w, L->fc_b, hidden, T, 4*d, d); gelu_kernel<<<(hn + 255)/256, 256>>>(hidden, hidden, hn); matmul_kernel<<<g4, tpb>>>(hidden, L->fcproj_w, L->fcproj_b, tmp, T, d, 4*d););
+
+        add_kernel<<<blocks, 256>>>(x, tmp, n);
+    }
+
+    TIME_BLOCK(t->layernorm, layerNorm_kernel<<<T, 256>>>(x, ln_out, m->ln_f_w, m->ln_f_b, T, d););
+
+    dim3 g5((m->vocab_size + 15)/16, (T + 15)/16);
+    TIME_BLOCK(t->logits, matmul_kernel<<<g5, tpb>>>(ln_out, m->wte_T, NULL, logits, T, m->vocab_size, d););
+
+    cudaEventDestroy(_s); cudaEventDestroy(_e);
+}
+
+void profile_at(Model *m, int T, int max_T) {
+    int d = m->d_model, n_head = m->n_head, vocab = m->vocab_size;
+    size_t nx = (size_t)T * d;
+    size_t cache_bytes = (size_t)12 * max_T * d * sizeof(float);
+
+    int *h_tokens = (int*)malloc(T * sizeof(int));
+    for (int i = 0; i < T; i++) h_tokens[i] = (i * 7919) % vocab;
+
+    int *d_tokens;
+    float *d_logits, *x, *ln_out, *qkv, *scores, *attn_out, *hidden, *tmp;
+    float *k_cache, *v_cache;
+
+    CHECK(cudaMalloc(&d_tokens, T * sizeof(int)));
+    CHECK(cudaMalloc(&d_logits, (size_t)T * vocab * sizeof(float)));
+    CHECK(cudaMalloc(&x, nx * sizeof(float)));
+    CHECK(cudaMalloc(&ln_out, nx * sizeof(float)));
+    CHECK(cudaMalloc(&qkv, (size_t)T * 3 * d * sizeof(float)));
+    CHECK(cudaMalloc(&scores, (size_t)n_head * T * T * sizeof(float)));
+    CHECK(cudaMalloc(&attn_out, nx * sizeof(float)));
+    CHECK(cudaMalloc(&hidden, (size_t)T * 4 * d * sizeof(float)));
+    CHECK(cudaMalloc(&tmp, nx * sizeof(float)));
+    CHECK(cudaMalloc(&k_cache, cache_bytes));
+    CHECK(cudaMalloc(&v_cache, cache_bytes));
+
+    CHECK(cudaMemcpy(d_tokens, h_tokens, T * sizeof(int), cudaMemcpyHostToDevice));
+    CHECK(cudaMemset(k_cache, 0, cache_bytes));
+    CHECK(cudaMemset(v_cache, 0, cache_bytes));
+
+    Timings warm = {0};
+    forward_pass_profiled(m, d_tokens, d_logits, x, ln_out, qkv, scores, attn_out, hidden, tmp, k_cache, v_cache, 0, T, max_T, &warm);
+    CHECK(cudaDeviceSynchronize());
+
+    const int REPS = 10;
+    Timings t = {0};
+    for (int r = 0; r < REPS; r++) {
+        CHECK(cudaMemset(k_cache, 0, cache_bytes));
+        CHECK(cudaMemset(v_cache, 0, cache_bytes));
+        forward_pass_profiled(m, d_tokens, d_logits, x, ln_out, qkv, scores, attn_out, hidden, tmp, k_cache, v_cache, 0, T, max_T, &t);
+    }
+    CHECK(cudaDeviceSynchronize());
+
+    float e = t.embed/REPS, ln = t.layernorm/REPS, q = t.qkv/REPS;
+    float a = t.attn/REPS, ap = t.attn_proj/REPS, mp = t.mlp/REPS, lg = t.logits/REPS;
+    float total = e + ln + q + a + ap + mp + lg;
+
+    printf("\n=== T = %d ===\n", T);
+    printf("%-12s %10s %8s\n", "category", "ms", "%");
+    printf("%-12s %10.3f %7.1f%%\n", "embed",     e,  100*e/total);
+    printf("%-12s %10.3f %7.1f%%\n", "layernorm", ln, 100*ln/total);
+    printf("%-12s %10.3f %7.1f%%\n", "qkv",       q,  100*q/total);
+    printf("%-12s %10.3f %7.1f%%\n", "attention", a,  100*a/total);
+    printf("%-12s %10.3f %7.1f%%\n", "attn_proj", ap, 100*ap/total);
+    printf("%-12s %10.3f %7.1f%%\n", "mlp",       mp, 100*mp/total);
+    printf("%-12s %10.3f %7.1f%%\n", "logits",    lg, 100*lg/total);
+    printf("%-12s %10.3f\n", "TOTAL", total);
+
+    free(h_tokens);
+    cudaFree(d_tokens); cudaFree(d_logits); cudaFree(x); cudaFree(ln_out);
+    cudaFree(qkv); cudaFree(scores); cudaFree(attn_out); cudaFree(hidden);
+    cudaFree(tmp); cudaFree(k_cache); cudaFree(v_cache);
+}
+
+void profile_forward(Model *m) {
+    profile_at(m, 5, 16);
+    profile_at(m, 128, 128);
+    profile_at(m, 512, 512);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         printf("Usage: %s <weights.bin>\n", argv[0]);
@@ -982,6 +1101,7 @@ int main(int argc, char **argv) {
     test_block(&m);
     test_cache(&m);
     test_forward(&m);
+    profile_forward(&m);
     model_free(&m);
     return 0;
 }
