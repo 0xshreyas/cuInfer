@@ -146,12 +146,12 @@ __global__ void add_kernel(float *x, const float *y, size_t n) {
     }
 }
 
-__global__ void embed_kernel(const int *tokens, const float *wte, const float *wpe, float *out, int T, int d) {
+__global__ void embed_kernel(const int *tokens, const float *wte, const float *wpe, float *out, int T, int d, int pos) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < T * d) {
         int t = i / d;
         int col = i % d;
-        out[i] = wte[(size_t)tokens[t] * d + col] + wpe[(size_t)t * d + col];
+        out[i] = wte[(size_t)tokens[t] * d + col] + wpe[(size_t)(pos + t) * d + col];
     }
 }
 
@@ -211,6 +211,13 @@ __global__ void cache_write_kernel(const float *qkv, float *k_cache, float *v_ca
     v_cache[cache_idx] = qkv[t * 3 * d + 2 * d + i];
 }
 
+__global__ void transpose_kernel(const float *in, float *out, int rows, int cols) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= rows * cols) return;
+    int r = idx / cols;
+    int c = idx % cols;
+    out[(size_t)c * rows + r] = in[idx];
+}
 
 // Structure for the loader includes the 12 tensors in a layer and parameters of a model
 typedef struct {
@@ -228,6 +235,7 @@ typedef struct {
     float *wte, *wpe;
     Layer layers[12];
     float *ln_f_w, *ln_f_b;
+    float *wte_T;
 } Model;
 
 static float *TAKE(Model *m, size_t *off, size_t n) {
@@ -290,6 +298,7 @@ int model_load(Model *m, const char *path) {
     free(host_buffer);
     size_t d = m->d_model;
     size_t off = 0;
+
     m->wte = TAKE(m, &off, (size_t)m->vocab_size * m->d_model);
     m->wpe = TAKE(m, &off, (size_t)m->max_pos * m->d_model);
 
@@ -314,11 +323,22 @@ int model_load(Model *m, const char *path) {
         printf("layout error: used %zu of %zu floats\n", off, n_floats);
         return 1;
     }
+
+    size_t wte_n = (size_t)m->vocab_size * m->d_model;
+    cudaError_t te = cudaMalloc(&m->wte_T, wte_n * sizeof(float));
+    if (te != cudaSuccess) {
+        printf("cudaMalloc wte_T failed: %s\n", cudaGetErrorString(te));
+        return 1;
+    }
+
+    transpose_kernel<<<(wte_n + 255)/256, 256>>>(m->wte, m->wte_T, m->vocab_size, m->d_model);
+    cudaDeviceSynchronize();
     return 0;
 }
 
 void model_free(Model *m) {
     cudaFree(m->all);
+    cudaFree(m->wte_T);
 }
 
 // To Verify the data from the GPU side, first method which is Copy back & check
@@ -577,7 +597,7 @@ void test_embed(Model *m) {
     cudaMalloc(&d_tokens, T * sizeof(int));
     cudaMalloc(&d_out, n * sizeof(float));
     cudaMemcpy(d_tokens, h_tokens, T * sizeof(int), cudaMemcpyHostToDevice);
-    embed_kernel<<<(n + 255)/256, 256>>>(d_tokens, m->wte, m->wpe, d_out, T, d);
+    embed_kernel<<<(n + 255)/256, 256>>>(d_tokens, m->wte, m->wpe, d_out, T, d, 0);
     cudaDeviceSynchronize();
 
     float *h_out = (float*)malloc(n * sizeof(float));
@@ -698,23 +718,22 @@ void test_cache(Model *m) {
     fclose(f);
 
     float *x, *ln_out, *qkv, *scores, *attn_out, *hidden, *tmp, *k_cache, *v_cache;
-    CHECK(cudaMalloc(&x,        n * sizeof(float)));
-    CHECK(cudaMalloc(&ln_out,   n * sizeof(float)));
-    CHECK(cudaMalloc(&qkv,      (size_t)T * 3 * d * sizeof(float)));
-    CHECK(cudaMalloc(&scores,   (size_t)n_head * max_T * max_T * sizeof(float)));
+    CHECK(cudaMalloc(&x, n * sizeof(float)));
+    CHECK(cudaMalloc(&ln_out, n * sizeof(float)));
+    CHECK(cudaMalloc(&qkv, (size_t)T * 3 * d * sizeof(float)));
+    CHECK(cudaMalloc(&scores, (size_t)n_head * max_T * max_T * sizeof(float)));
     CHECK(cudaMalloc(&attn_out, n * sizeof(float)));
-    CHECK(cudaMalloc(&hidden,   (size_t)T * 4 * d * sizeof(float)));
-    CHECK(cudaMalloc(&tmp,      n * sizeof(float)));
-    CHECK(cudaMalloc(&k_cache,  (size_t)12 * max_T * d * sizeof(float)));
-    CHECK(cudaMalloc(&v_cache,  (size_t)12 * max_T * d * sizeof(float)));
+    CHECK(cudaMalloc(&hidden, (size_t)T * 4 * d * sizeof(float)));
+    CHECK(cudaMalloc(&tmp, n * sizeof(float)));
+    CHECK(cudaMalloc(&k_cache, (size_t)12 * max_T * d * sizeof(float)));
+    CHECK(cudaMalloc(&v_cache, (size_t)12 * max_T * d * sizeof(float)));
 
     // --- Run A: all 5 tokens at once ---
     CHECK(cudaMemset(k_cache, 0, (size_t)12 * max_T * d * sizeof(float)));
     CHECK(cudaMemset(v_cache, 0, (size_t)12 * max_T * d * sizeof(float)));
     CHECK(cudaMemcpy(x, h_embed, n * sizeof(float), cudaMemcpyHostToDevice));
 
-    block_forward(&m->layers[0], x, ln_out, qkv, scores, attn_out, hidden, tmp,
-                  k_cache, v_cache, 0, 0, T, d, n_head, max_T);
+    block_forward(&m->layers[0], x, ln_out, qkv, scores, attn_out, hidden, tmp, k_cache, v_cache, 0, 0, T, d, n_head, max_T);
     CHECK(cudaDeviceSynchronize());
 
     float *outA = (float*)malloc(n * sizeof(float));
@@ -725,13 +744,11 @@ void test_cache(Model *m) {
     CHECK(cudaMemset(v_cache, 0, (size_t)12 * max_T * d * sizeof(float)));
 
     CHECK(cudaMemcpy(x, h_embed, (size_t)3 * d * sizeof(float), cudaMemcpyHostToDevice));
-    block_forward(&m->layers[0], x, ln_out, qkv, scores, attn_out, hidden, tmp,
-                  k_cache, v_cache, 0, 0, 3, d, n_head, max_T);
+    block_forward(&m->layers[0], x, ln_out, qkv, scores, attn_out, hidden, tmp, k_cache, v_cache, 0, 0, 3, d, n_head, max_T);
     CHECK(cudaDeviceSynchronize());
 
     CHECK(cudaMemcpy(x, h_embed + 3 * d, (size_t)2 * d * sizeof(float), cudaMemcpyHostToDevice));
-    block_forward(&m->layers[0], x, ln_out, qkv, scores, attn_out, hidden, tmp,
-                  k_cache, v_cache, 0, 3, 2, d, n_head, max_T);
+    block_forward(&m->layers[0], x, ln_out, qkv, scores, attn_out, hidden, tmp, k_cache, v_cache, 0, 3, 2, d, n_head, max_T);
     CHECK(cudaDeviceSynchronize());
 
     float *outB = (float*)malloc((size_t)2 * d * sizeof(float));
@@ -825,6 +842,118 @@ void test_block(Model *m) {
     free(layer0_buffer);
 }
 
+void forward_pass(Model *m, const int *d_tokens, float *logits, float *x, float *ln_out, float *qkv, float *scores, float *attn_out, float *hidden, float *tmp, float *k_cache, float *v_cache, int pos, int T, int max_T) {
+    int d = m->d_model;
+    int n_head = m->n_head;
+    size_t n = (size_t)T * d;
+    
+    //embeddings
+    embed_kernel<<<(n + 255)/256, 256>>>(d_tokens, m->wte, m->wpe, x, T, d, pos);
+
+    //12 transformer blocks
+    for (int layer = 0; layer < m->n_layer; layer++) {
+        block_forward(&m->layers[layer], x, ln_out, qkv, scores, attn_out, hidden, tmp, k_cache, v_cache, layer, pos, T, d, n_head, max_T);
+    }
+
+    // Final LayerNorm
+    layerNorm_kernel<<<T, 256>>>(x, ln_out, m->ln_f_w, m->ln_f_b, T, d);
+
+    // Project to Vocabulary - no bias, uses the transposed wte
+    dim3 tpb(16, 16);
+    dim3 grid((m->vocab_size + 15)/16, (T + 15)/16);
+    matmul_kernel<<<grid, tpb>>>(ln_out, m->wte_T, NULL, logits, T, m->vocab_size, d);
+}
+
+void test_forward(Model *m) {
+    int T = 5, vocab = 50257, d_model = 768, n_head = 12, max_T = 16;
+    size_t n  = (size_t)T * vocab;      // logits size
+    size_t nx = (size_t)T * d_model;    // hidden state size
+
+    // ---- read the oracle ----
+    int h_tokens[5];
+    FILE *f = fopen("../export/oracle_tokens.bin", "rb");
+    if (!f) { printf("Could not open oracle_tokens.bin\n"); return; }
+    if (fread(h_tokens, sizeof(int), T, f) != (size_t)T) {
+        printf("Short read on oracle_tokens.bin\n"); fclose(f); return;
+    }
+    fclose(f);
+
+    float *h_ref = (float*)malloc(n * sizeof(float));
+    f = fopen("../export/oracle_logits.bin", "rb");
+    if (!f) { printf("Could not open oracle_logits.bin\n"); free(h_ref); return; }
+    if (fread(h_ref, sizeof(float), n, f) != n) {
+        printf("Short read on oracle_logits.bin\n"); fclose(f); free(h_ref); return;
+    }
+    fclose(f);
+
+    // ---- allocate ----
+    int *d_tokens;
+    float *d_logits, *x, *ln_out, *qkv, *scores, *attn_out, *hidden, *tmp;
+    float *k_cache, *v_cache;
+    size_t cache_bytes = (size_t)12 * max_T * d_model * sizeof(float);
+
+    CHECK(cudaMalloc(&d_tokens, T * sizeof(int)));
+    CHECK(cudaMalloc(&d_logits, n * sizeof(float)));
+    CHECK(cudaMalloc(&x,        nx * sizeof(float)));
+    CHECK(cudaMalloc(&ln_out,   nx * sizeof(float)));
+    CHECK(cudaMalloc(&qkv,      (size_t)T * 3 * d_model * sizeof(float)));
+    CHECK(cudaMalloc(&scores,   (size_t)n_head * max_T * max_T * sizeof(float)));
+    CHECK(cudaMalloc(&attn_out, nx * sizeof(float)));
+    CHECK(cudaMalloc(&hidden,   (size_t)T * 4 * d_model * sizeof(float)));
+    CHECK(cudaMalloc(&tmp,      nx * sizeof(float)));
+    CHECK(cudaMalloc(&k_cache,  cache_bytes));
+    CHECK(cudaMalloc(&v_cache,  cache_bytes));
+
+    CHECK(cudaMemcpy(d_tokens, h_tokens, T * sizeof(int), cudaMemcpyHostToDevice));
+    CHECK(cudaMemset(k_cache, 0, cache_bytes));
+    CHECK(cudaMemset(v_cache, 0, cache_bytes));
+
+    // ---- run ----
+    forward_pass(m, d_tokens, d_logits, x, ln_out, qkv, scores, attn_out,
+                 hidden, tmp, k_cache, v_cache, 0, T, max_T);
+    CHECK(cudaDeviceSynchronize());
+    CHECK(cudaGetLastError());
+
+    float *h_out = (float*)malloc(n * sizeof(float));
+    CHECK(cudaMemcpy(h_out, d_logits, n * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // ---- relative error ----
+    float maxRel = 0.0f;
+    for (size_t i = 0; i < n; i++) {
+        float den = fabsf(h_ref[i]) + 1e-2f;
+        float r = fabsf(h_out[i] - h_ref[i]) / den;
+        if (r > maxRel) maxRel = r;
+    }
+    printf("logits rel diff: %.3e  %s\n", maxRel, maxRel < 1e-2 ? "PASS" : "FAIL");
+
+    // ---- top-5 at the last position ----
+    float *last = h_out + (size_t)(T - 1) * vocab;
+    printf("top5 gpu: ");
+    for (int k = 0; k < 5; k++) {
+        int best = 0;
+        for (int i = 1; i < vocab; i++) if (last[i] > last[best]) best = i;
+        printf("%d ", best);
+        last[best] = -INFINITY;
+    }
+    printf("\nexpected: 11 262 290 13 257\n");
+
+    float *ref_last = h_ref + (size_t)(T - 1) * vocab;
+    printf("top5 ref: ");
+    for (int k = 0; k < 5; k++) {
+        int best = 0;
+        for (int i = 1; i < vocab; i++) if (ref_last[i] > ref_last[best]) best = i;
+        printf("%d ", best);
+        ref_last[best] = -INFINITY;
+    }
+    printf("\n");
+
+    // ---- cleanup ----
+    free(h_ref); free(h_out);
+    cudaFree(d_tokens); cudaFree(d_logits); cudaFree(x); cudaFree(ln_out);
+    cudaFree(qkv); cudaFree(scores); cudaFree(attn_out); cudaFree(hidden);
+    cudaFree(tmp); cudaFree(k_cache); cudaFree(v_cache);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         printf("Usage: %s <weights.bin>\n", argv[0]);
@@ -852,6 +981,7 @@ int main(int argc, char **argv) {
     // test_scores();
     test_block(&m);
     test_cache(&m);
+    test_forward(&m);
     model_free(&m);
     return 0;
 }
