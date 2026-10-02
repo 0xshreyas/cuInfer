@@ -1,7 +1,7 @@
 #include <stdio.h>
 
 __global__ void hello_kernel() {
-    printf("Hello CUDA from thread %d of block %d\n", threadIdx.x, blockIdx.x);
+    printf("Hello CUDA from thread %d of block %d of block Dim %d\n", threadIdx.x, blockIdx.x, blockDim.x);
 }
 
 int main() {

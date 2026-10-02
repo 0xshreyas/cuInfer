@@ -5,4 +5,11 @@ __pycache__/
 hello
 devinfo
 vecadd
-matmul
+matmul*.bin
+venv/
+phase0/async
+phase0/bandwidth
+phase0/coalesce
+phase0/diverge
+phase0/rounding
+bench/bench_matmul
