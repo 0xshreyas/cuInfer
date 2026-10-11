@@ -1,3 +1,4 @@
+#include "matmul_fast.cuh"
 #include<stdio.h>
 #include<stdlib.h>
 #include<math.h>
@@ -559,13 +560,13 @@ void mlp_forward(Layer *L, float *x, float *hidden, float *out, int T, int d) {
     dim3 tpb(16, 16);
     
     dim3 g1((4*d + 15)/16, (T + 15)/16);
-    matmul_kernel<<<g1, tpb>>>(x, L->fc_w, L->fc_b, hidden, T, 4*d, d);
+    matmul_gpu(x, L->fc_w, L->fc_b, hidden, T, 4*d, d);
 
     size_t hn = (size_t)T * 4 * d;
     gelu_kernel<<<(hn + 255)/256, 256>>>(hidden, hidden, hn);
 
     dim3 g2((d + 15)/16, (T + 15)/16);
-    matmul_kernel<<<g2, tpb>>>(hidden, L->fcproj_w, L->fcproj_b, out, T, d, 4*d);
+    matmul_gpu(hidden, L->fcproj_w, L->fcproj_b, out, T, d, 4*d);
 }
 
 void test_embed(Model *m) {
@@ -676,7 +677,7 @@ void attention_forward(Layer *L, float *x, float *qkv, float *scores, float *att
 
     // QKV Projection: (T,d) @ (d,3d) -> (T,3d)
     dim3 g1((3 * d + 15)/16, (T + 15)/16);
-    matmul_kernel<<<g1, tpb>>>(x, L->attn_w, L->attn_b, qkv, T, 3 * d, d);
+    matmul_gpu(x, L->attn_w, L->attn_b, qkv, T, 3 * d, d);
 
     // K and V into the cache
     int n_cache = T * d;
@@ -698,7 +699,7 @@ void attention_forward(Layer *L, float *x, float *qkv, float *scores, float *att
 
     // Output Projection (T,d) @ (d,d) -> (T,d)
     dim3 g2((d + 15)/16, (T + 15)/16);
-    matmul_kernel<<<g2, tpb>>>(attn_out, L->proj_w, L->proj_b, out, T, d, d);
+    matmul_gpu(attn_out, L->proj_w, L->proj_b, out, T, d, d);
 }
 
 void block_forward(Layer *L, float *x, float *ln_out, float *qkv, float *scores, float *attn_out, float *hidden, float *tmp, float *k_cache, float *v_cache, int layer, int pos, int T, int d, int n_head, int max_T) {
@@ -866,7 +867,7 @@ void forward_pass(Model *m, const int *d_tokens, float *logits, float *x, float 
     // Project to Vocabulary - no bias, uses the transposed wte
     dim3 tpb(16, 16);
     dim3 grid((m->vocab_size + 15)/16, (T + 15)/16);
-    matmul_kernel<<<grid, tpb>>>(ln_out, m->wte_T, NULL, logits, T, m->vocab_size, d);
+    matmul_gpu(ln_out, m->wte_T, NULL, logits, T, m->vocab_size, d);
 }
 
 void test_forward(Model *m) {
@@ -977,13 +978,13 @@ void forward_pass_profiled(Model *m, const int *d_tokens, float *logits, float *
         TIME_BLOCK(t->layernorm, layerNorm_kernel<<<T, 256>>>(x, ln_out, L->ln_1_w, L->ln_1_b, T, d););
 
         dim3 g1((3 * d + 15)/16, (T + 15)/16);
-        TIME_BLOCK(t->qkv, matmul_kernel<<<g1, tpb>>>(ln_out, L->attn_w, L->attn_b, qkv, T, 3*d, d););
+        TIME_BLOCK(t->qkv, matmul_gpu(ln_out, L->attn_w, L->attn_b, qkv, T, 3*d, d););
 
         int n_scores = n_head * T * total_len;
         TIME_BLOCK(t->attn, cache_write_kernel<<<(T*d + 255)/256, 256>>>(qkv, k_cache, v_cache, layer, pos, T, d, max_T); scores_kernel<<<(n_scores + 255)/256, 256>>>(qkv, k_cache, scores, layer, T, total_len, n_head, head_dim, max_T); mask_kernel<<<(n_scores + 255)/256, 256>>>(scores, T, total_len, n_head, pos); softmax_kernel<<<n_head * T, 256>>>(scores, n_head * T, total_len); weighted_v_kernel<<<(T*d + 255)/256, 256>>>(scores, v_cache, attn_out, layer, T, total_len, n_head, head_dim, max_T););
 
         dim3 g2((d + 15)/16, (T + 15)/16);
-        TIME_BLOCK(t->attn_proj, matmul_kernel<<<g2, tpb>>>(attn_out, L->proj_w, L->proj_b, tmp, T, d, d););
+        TIME_BLOCK(t->attn_proj, matmul_gpu(attn_out, L->proj_w, L->proj_b, tmp, T, d, d););
 
         add_kernel<<<blocks, 256>>>(x, tmp, n);
 
@@ -992,7 +993,7 @@ void forward_pass_profiled(Model *m, const int *d_tokens, float *logits, float *
         dim3 g3((4*d + 15)/16, (T + 15)/16);
         dim3 g4((d + 15)/16, (T + 15)/16);
         size_t hn = (size_t)T * 4 * d;
-        TIME_BLOCK(t->mlp, matmul_kernel<<<g3, tpb>>>(ln_out, L->fc_w, L->fc_b, hidden, T, 4*d, d); gelu_kernel<<<(hn + 255)/256, 256>>>(hidden, hidden, hn); matmul_kernel<<<g4, tpb>>>(hidden, L->fcproj_w, L->fcproj_b, tmp, T, d, 4*d););
+        TIME_BLOCK(t->mlp, matmul_gpu(ln_out, L->fc_w, L->fc_b, hidden, T, 4*d, d); gelu_kernel<<<(hn + 255)/256, 256>>>(hidden, hidden, hn); matmul_gpu(hidden, L->fcproj_w, L->fcproj_b, tmp, T, d, 4*d););
 
         add_kernel<<<blocks, 256>>>(x, tmp, n);
     }
@@ -1000,7 +1001,7 @@ void forward_pass_profiled(Model *m, const int *d_tokens, float *logits, float *
     TIME_BLOCK(t->layernorm, layerNorm_kernel<<<T, 256>>>(x, ln_out, m->ln_f_w, m->ln_f_b, T, d););
 
     dim3 g5((m->vocab_size + 15)/16, (T + 15)/16);
-    TIME_BLOCK(t->logits, matmul_kernel<<<g5, tpb>>>(ln_out, m->wte_T, NULL, logits, T, m->vocab_size, d););
+    TIME_BLOCK(t->logits, matmul_gpu(ln_out, m->wte_T, NULL, logits, T, m->vocab_size, d););
 
     cudaEventDestroy(_s); cudaEventDestroy(_e);
 }
@@ -1073,6 +1074,7 @@ void profile_forward(Model *m) {
     profile_at(m, 512, 512);
 }
 
+#include "bench_e2e.cuh"
 int main(int argc, char **argv) {
     if (argc < 2) {
         printf("Usage: %s <weights.bin>\n", argv[0]);
@@ -1102,6 +1104,7 @@ int main(int argc, char **argv) {
     test_cache(&m);
     test_forward(&m);
     profile_forward(&m);
+    bench_e2e(&m);
     model_free(&m);
     return 0;
 }
