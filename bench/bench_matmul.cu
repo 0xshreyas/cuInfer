@@ -14,6 +14,12 @@
 #define BK 8
 #define TM 8
 
+#define BM2 128   // each block computes a BM2 x BN2 tile of C
+#define BN2 128
+#define BK2 8     // width of each K chunk (one phase)
+#define TM2 8     // each thread computes a TM2 x TN2 patch
+#define TN2 8
+#define NT2 ((BM2 / TM2) * (BN2 / TN2))   // threads per block = 16 x 16 = 256
 
 
 #define CK(x) do { cudaError_t e = (x); if (e != cudaSuccess) {          \
@@ -131,6 +137,60 @@ __global__ void matmul_1d(const float *A, const float *B, const float *bias, flo
     }
 }
 
+__global__ void matmul_2d(const float *A, const float *B, const float *bias,
+                          float *C, int M, int N, int K) {
+    __shared__ float As[BM2][BK2];        // 128 x 8
+    __shared__ float Bs[BK2][BN2];        // 8 x 128
+
+    int tid = threadIdx.x;                // 0 .. 255
+    int blockRow = blockIdx.y * BM2;      // first C row of this block
+    int blockCol = blockIdx.x * BN2;      // first C column of this block
+
+    // what this thread COMPUTES: an 8 x 8 patch of the block's tile
+    int threadRow = tid / (BN2 / TN2);    // 0 .. 15 -> rows threadRow*8 .. +7
+    int threadCol = tid % (BN2 / TN2);    // 0 .. 15 -> cols threadCol*8 .. +7
+
+    float sum[TM2][TN2] = {{0.0f}};       // 64 running totals, in registers
+    float aReg[TM2], bReg[TN2];           // 8 A numbers and 8 B numbers per step
+
+    for (int t = 0; t < (K + BK2 - 1) / BK2; t++) {
+        // load As: 128 x 8 = 1024 numbers, 256 threads -> 4 each
+        for (int idx = tid; idx < BM2 * BK2; idx += NT2) {
+            int r = idx / BK2, c = idx % BK2;
+            int gr = blockRow + r, gc = t * BK2 + c;          // position in A
+            As[r][c] = (gr < M && gc < K) ? A[gr * K + gc] : 0.0f;
+        }
+        // load Bs: 8 x 128 = 1024 numbers, 4 each
+        for (int idx = tid; idx < BK2 * BN2; idx += NT2) {
+            int r = idx / BN2, c = idx % BN2;
+            int gr = t * BK2 + r, gc = blockCol + c;          // position in B
+            Bs[r][c] = (gr < K && gc < N) ? B[gr * N + gc] : 0.0f;
+        }
+        __syncthreads();
+
+        for (int k = 0; k < BK2; k++) {
+            for (int i = 0; i < TM2; i++) aReg[i] = As[threadRow * TM2 + i][k];  // 8 reads
+            for (int j = 0; j < TN2; j++) bReg[j] = Bs[k][threadCol * TN2 + j];  // 8 reads
+            for (int i = 0; i < TM2; i++)                                        // 64 multiply-adds
+                for (int j = 0; j < TN2; j++)
+                    sum[i][j] += aReg[i] * bReg[j];
+        }
+        __syncthreads();
+    }
+
+    for (int i = 0; i < TM2; i++) {
+        int row = blockRow + threadRow * TM2 + i;
+        for (int j = 0; j < TN2; j++) {
+            int col = blockCol + threadCol * TN2 + j;
+            if (row < M && col < N) {
+                float v = sum[i][j];
+                if (bias) v += bias[col];
+                C[row * N + col] = v;
+            }
+        }
+    }
+}
+
 void launch_1d(const float *A, const float *B, const float *bias,
                float *C, int M, int N, int K) {
     dim3 tpb(BM * BN / TM);                         // 512 threads, numbered in a line
@@ -144,12 +204,20 @@ void launch_tiled(const float *A, const float *B, const float *bias, float *C, i
     matmul_tiled<<<grid, tpb>>>(A, B, bias, C, M, N, K);
 }
 
+void launch_2d(const float *A, const float *B, const float *bias,
+               float *C, int M, int N, int K) {
+    dim3 tpb(NT2);                                       // 256 threads
+    dim3 grid((N + BN2 - 1) / BN2, (M + BM2 - 1) / BM2);
+    matmul_2d<<<grid, tpb>>>(A, B, bias, C, M, N, K);
+}
+
 struct Kernel { const char *name; Launcher fn; };
 Kernel kernels[] = {
     {"cublas", launch_cublas},
     {"naive",  launch_naive},
     {"tiled",  launch_tiled},
     {"1d",     launch_1d},
+    {"2d",     launch_2d},
     // your new kernels get added here
 };
 const int NK = sizeof(kernels) / sizeof(kernels[0]);
@@ -199,7 +267,7 @@ int main(int argc, char **argv) {
 
     cudaDeviceProp prop;
     CK(cudaGetDeviceProperties(&prop, 0));
-    printf("GPU: %s, %d SMs, %d max threads per SM.  M = %d tokens\n\n", prop.name, prop.multiProcessorCount, prop.maxThreadsPerMultiProcessor, M);
+    printf("GPU: %s, %d SMs, %d max threads/SM, %d registers/SM.  M = %d tokens\n\n", prop.name, prop.multiProcessorCount, prop.maxThreadsPerMultiProcessor, prop.regsPerMultiprocessor, M);
     if (cublasCreate(&g_handle) != CUBLAS_STATUS_SUCCESS) {
         printf("cublasCreate failed\n");
         return 1;
