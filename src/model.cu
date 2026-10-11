@@ -253,7 +253,7 @@ static float *TAKE(Model *m, size_t *off, size_t n) {
 int model_load(Model *m, const char *path) {
     FILE *f = fopen(path, "rb");
     if (f == NULL) {
-        printf("Could not open the file\n");
+        printf("FAIL: could not open the file\n");
         return 1;
     }
 
@@ -574,7 +574,7 @@ void test_embed(Model *m) {
     int h_tokens[5];
     FILE *f = fopen("../export/oracle_tokens.bin", "rb");
     if (!f) {
-        printf("Could not open oracle_tokens.bin\n");
+        printf("FAIL: could not open oracle_tokens.bin\n");
         return;
     }
     if(fread(h_tokens, sizeof(int), T, f) != (size_t)T) {
@@ -586,7 +586,7 @@ void test_embed(Model *m) {
     float *h_ref = (float*)malloc(n * sizeof(float));
     f = fopen("../export/oracle_embed.bin", "rb");
     if (!f) {
-        printf("could not open oracle_embed.bin\n");
+        printf("FAIL: could not open oracle_embed.bin\n");
         return;
     }
     if(fread(h_ref, sizeof(float), n, f) != n) {
@@ -671,7 +671,7 @@ void test_cache(Model *m) {
 
     float *h_embed = (float*)malloc(n * sizeof(float));
     FILE *f = fopen("../export/oracle_embed.bin", "rb");
-    if (!f) { printf("could not open oracle_embed.bin\n"); return; }
+    if (!f) { printf("FAIL: could not open oracle_embed.bin\n"); return; }
     if (fread(h_embed, sizeof(float), n, f) != n) { printf("short read\n"); fclose(f); return; }
     fclose(f);
 
@@ -730,7 +730,7 @@ void test_cache(Model *m) {
 void test_block(Model *m) {
     float *embed_buffer = (float*)malloc(3840 * sizeof(float));
     FILE *embed_f = fopen("../export/oracle_embed.bin", "rb");
-    if (!embed_f) {printf("Could not open oracle_embed.bin\n"); return;}
+    if (!embed_f) {printf("FAIL: could not open oracle_embed.bin\n"); return;}
     if (fread(embed_buffer, sizeof(float), 3840, embed_f) != 3840) {
         printf("Short Read\n"); fclose(embed_f); return;
     }
@@ -738,7 +738,7 @@ void test_block(Model *m) {
     
     float *layer_ref = (float*)malloc(3840 * sizeof(float));
     FILE *layer_f = fopen("../export/oracle_layer00.bin", "rb");
-    if (!layer_f) {printf("Could not open oracle_layer00.bin\n"); return;}
+    if (!layer_f) {printf("FAIL: could not open oracle_layer00.bin\n"); return;}
     if (fread(layer_ref, sizeof(float), 3840, layer_f) != 3840) {
         printf("Short Read\n"); fclose(layer_f); return;
     }
@@ -829,7 +829,7 @@ void test_forward(Model *m) {
     // ---- read the oracle ----
     int h_tokens[5];
     FILE *f = fopen("../export/oracle_tokens.bin", "rb");
-    if (!f) { printf("Could not open oracle_tokens.bin\n"); return; }
+    if (!f) { printf("FAIL: could not open oracle_tokens.bin\n"); return; }
     if (fread(h_tokens, sizeof(int), T, f) != (size_t)T) {
         printf("Short read on oracle_tokens.bin\n"); fclose(f); return;
     }
@@ -837,7 +837,7 @@ void test_forward(Model *m) {
 
     float *h_ref = (float*)malloc(n * sizeof(float));
     f = fopen("../export/oracle_logits.bin", "rb");
-    if (!f) { printf("Could not open oracle_logits.bin\n"); free(h_ref); return; }
+    if (!f) { printf("FAIL: could not open oracle_logits.bin\n"); free(h_ref); return; }
     if (fread(h_ref, sizeof(float), n, f) != n) {
         printf("Short read on oracle_logits.bin\n"); fclose(f); free(h_ref); return;
     }

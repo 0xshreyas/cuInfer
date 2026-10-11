@@ -14,5 +14,5 @@ x.astype(np.float32).tofile("oracle_embed.bin")
 from gpt2_numpy import block
 for i, L in enumerate(layers):
     x = block(x, L)
-    x.astype(np.float32).tofile(f"Oracle_layer{i:02d}.bin")
+    x.astype(np.float32).tofile(f"oracle_layer{i:02d}.bin")
 print("Saved 12 Layer Outputs")
