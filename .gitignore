@@ -13,3 +13,5 @@ phase0/coalesce
 phase0/diverge
 phase0/rounding
 bench/bench_matmul
+*.sass
+sass.txt
