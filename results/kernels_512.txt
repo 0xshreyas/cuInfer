@@ -1,0 +1,33 @@
+GPU: NVIDIA GeForce RTX 5060 Laptop GPU, 26 SMs, 1536 max threads/SM, 65536 registers/SM.  M = 512 tokens
+
+shape   kernel          ms    GFLOPS  % cuBLAS    error
+qkv     cublas       0.212      8534      100%  0.0e+00
+qkv     naive        1.661      1091       13%  1.1e-06
+qkv     tiled        1.211      1497       18%  1.1e-06
+qkv     1d           0.718      2522       30%  1.1e-06
+qkv     2d           0.486      3727       44%  1.1e-06
+
+proj    cublas       0.080      7532      100%  0.0e+00
+proj    naive        0.565      1069       14%  1.1e-06
+proj    tiled        0.416      1453       19%  1.1e-06
+proj    1d           0.266      2273       30%  1.1e-06
+proj    2d           0.226      2676       36%  1.1e-06
+
+fc      cublas       0.285      8487      100%  0.0e+00
+fc      naive        2.215      1090       13%  1.4e-06
+fc      tiled        1.615      1496       18%  1.4e-06
+fc      1d           0.922      2619       31%  1.4e-06
+fc      2d           0.560      4314       51%  1.4e-06
+
+fcproj  cublas       0.285      8488      100%  0.0e+00
+fcproj  naive        2.225      1086       13%  2.2e-06
+fcproj  tiled        1.652      1463       17%  2.2e-06
+fcproj  1d           1.030      2345       28%  2.2e-06
+fcproj  2d           0.863      2800       33%  2.2e-06
+
+logits  cublas       3.608     10953      100%  0.0e+00
+logits  naive       37.001      1068       10%  0.0e+00
+logits  tiled       27.356      1445       13%  0.0e+00
+logits  1d          16.875      2342       21%  0.0e+00
+logits  2d          11.285      3502       32%  0.0e+00
+

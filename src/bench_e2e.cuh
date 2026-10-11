@@ -1,4 +1,4 @@
-// Phase 4 Day 3: clean end-to-end timing of the whole model.
+// End-to-end timing of the whole model: CUDA events, warm-up, averaged runs.
 // prefill = one forward pass over a T-token prompt (time to first token)
 // decode  = tokens per second when generating one token at a time with the KV cache
 void bench_e2e(Model *m) {

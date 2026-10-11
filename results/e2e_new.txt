@@ -1,0 +1,72 @@
+n_layer = 12, heads = 12, d_model = 768, vocab_size = 50257, max_pos = 1024
+Load Success
+WTE at offset 0, ln_f_b at 124439040 floats 
+wte: -0.11010301 -0.03926672 0.03310751 
+ln_f_b: 0.00108716 0.03652938 -0.06729616 
+WTE Sum: 14659.964005 (comparing against python's checksum which is =14659.962891=)
+GELU Max Diff: 2.384e-07 PASS
+layerNorm Max Diff: 3.576e-07  PASS
+SoftMax Max Diff: 2.980e-08 RowSum Err: 1.192e-07 PASS
+Embed Difference: 0.000e+00 PASS
+layer  0: abs 4.578e-05  rel 9.838e-04  max|ref| 103.95  PASS
+layer  1: abs 6.714e-04  rel 1.723e-03  max|ref| 591.54  PASS
+layer  2: abs 5.371e-03  rel 2.744e-03  max|ref| 2478.06  PASS
+layer  3: abs 3.662e-03  rel 2.182e-03  max|ref| 2635.43  PASS
+layer  4: abs 2.930e-03  rel 1.361e-03  max|ref| 2776.86  PASS
+layer  5: abs 2.441e-03  rel 1.540e-03  max|ref| 2870.95  PASS
+layer  6: abs 2.197e-03  rel 1.452e-03  max|ref| 2927.49  PASS
+layer  7: abs 2.197e-03  rel 1.565e-03  max|ref| 2961.72  PASS
+layer  8: abs 1.953e-03  rel 5.042e-03  max|ref| 2982.81  PASS
+layer  9: abs 1.953e-03  rel 2.252e-03  max|ref| 2993.43  PASS
+layer 10: abs 1.953e-03  rel 1.648e-03  max|ref| 2994.82  PASS
+layer 11: abs 4.242e-03  rel 5.279e-03  max|ref| 359.20  PASS
+cache split-batch diff: 0.000e+00  PASS
+logits rel diff: 7.810e-06  PASS
+top5 gpu: 1757 509 449 3899 406 
+expected: 11 262 290 13 257
+top5 ref: 1757 509 449 3899 406 
+
+=== T = 5 ===
+category             ms        %
+embed             0.008     0.2%
+layernorm         0.300     5.6%
+qkv               0.593    11.2%
+attention         0.491     9.2%
+attn_proj         0.585    11.0%
+mlp               2.759    51.9%
+logits            0.580    10.9%
+TOTAL             5.317
+
+=== T = 128 ===
+category             ms        %
+embed             0.016     0.1%
+layernorm         0.271     1.7%
+qkv               1.928    12.0%
+attention         3.191    19.9%
+attn_proj         0.924     5.7%
+mlp               6.924    43.1%
+logits            2.818    17.5%
+TOTAL            16.071
+
+=== T = 512 ===
+category             ms        %
+embed             0.024     0.0%
+layernorm         0.481     0.6%
+qkv               7.329     8.5%
+attention        42.474    49.2%
+attn_proj         3.706     4.3%
+mlp              21.832    25.3%
+logits           10.507    12.2%
+TOTAL            86.352
+
+=== End-to-end (clean timing) ===
+prefill T=  5 :    4.655 ms
+prefill T=128 :   15.837 ms
+prefill T=512 :   85.716 ms
+decode        :    4.638 ms/token =  215.6 tokens/s
+
+=== End-to-end (clean timing) ===
+prefill T=  5 :    4.671 ms
+prefill T=128 :   15.907 ms
+prefill T=512 :   90.141 ms
+decode        :    4.972 ms/token =  201.1 tokens/s

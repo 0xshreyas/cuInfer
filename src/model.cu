@@ -370,7 +370,7 @@ double sum_on_gpu(const float *ptr, size_t n) {
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         printf("Error from CUDA: %s\n", cudaGetErrorString(err));
-        return 1;
+        return -1.0;
     }
 
     float *host_array = (float*)malloc(blocks * sizeof(float));
@@ -557,7 +557,6 @@ void softmax_test() {
 }
 
 void mlp_forward(Layer *L, float *x, float *hidden, float *out, int T, int d) {
-    dim3 tpb(16, 16);
     
     dim3 g1((4*d + 15)/16, (T + 15)/16);
     matmul_gpu(x, L->fc_w, L->fc_b, hidden, T, 4*d, d);
@@ -622,58 +621,11 @@ void test_embed(Model *m) {
     cudaFree(d_out);    
 }
 
-// void test_scores() {
-//     size_t n = 5 * 2304;
-//     float *h_qkv = (float*)malloc(n * sizeof(float));
-//     for (size_t i = 0; i < n; i++) h_qkv[i] = (rand() % 2000 - 1000) / 100.0f;
-//     float *d_qkv;
-//     cudaMalloc(&d_qkv, n * sizeof(float));
-//     cudaMemcpy(d_qkv, h_qkv, n * sizeof(float), cudaMemcpyHostToDevice);
-
-//     size_t out_n = (size_t)12 * 5 * 5;
-//     float *d_scores;
-//     cudaMalloc(&d_scores, out_n * sizeof(float));
-
-//     scores_kernel<<<(out_n + 255)/256, 256>>>(d_qkv, d_scores, 5, 12, 64);
-//     cudaDeviceSynchronize();
-
-//     float *h_out = (float*)malloc(out_n * sizeof(float));
-//     cudaMemcpy(h_out, d_scores, out_n * sizeof(float), cudaMemcpyDeviceToHost);
-
-//     float *h_ref = (float*)malloc(out_n * sizeof(float));
-//     int T = 5, n_head = 12, head_dim = 64, d3 = 3 * n_head * head_dim;
-//     for (int h = 0; h < n_head; h++) {
-//         for (int i = 0; i < T; i++) {
-//             for (int j = 0; j < T; j++) {
-//                 const float *q = h_qkv + (size_t)i * d3 + h * head_dim;
-//                 const float *k = h_qkv + (size_t)j * d3 + n_head * head_dim + h * head_dim;
-
-//                 float sum = 0.0f;
-//                 for (int e = 0; e < head_dim; e++) sum+= q[e] * k[e];
-//                 h_ref[h * T * T + i * T + j] = sum / sqrtf((float)head_dim);
-//             }
-//         }
-//     }
-
-//     float maxDiff = 0.0f;
-//     for (size_t i = 0; i < out_n; i++) {
-//         float df = fabsf(h_out[i] - h_ref[i]);
-//         if (df > maxDiff) maxDiff = df;
-//     }
-
-//     printf("Scores Difference: %.3e %s\n", maxDiff, maxDiff < 1e-4 ? "PASS" : "FAIL");
-//     cudaFree(d_qkv);
-//     cudaFree(d_scores);
-//     free(h_qkv);
-//     free(h_ref);
-//     free(h_out);
-// }
 
 void attention_forward(Layer *L, float *x, float *qkv, float *scores, float *attn_out, float *out, float *k_cache, float *v_cache, int layer, int pos, int T, int d, int n_head, int max_T) {
     
     int head_dim = d / n_head;
     int total_len = pos + T;
-    dim3 tpb(16, 16);
 
     // QKV Projection: (T,d) @ (d,3d) -> (T,3d)
     dim3 g1((3 * d + 15)/16, (T + 15)/16);
@@ -687,7 +639,7 @@ void attention_forward(Layer *L, float *x, float *qkv, float *scores, float *att
     int n_scores = n_head * T * total_len;
     scores_kernel<<<(n_scores + 255)/256, 256>>>(qkv, k_cache, scores, layer, T, total_len, n_head, head_dim, max_T);
 
-    // Casual Mask
+    // Causal mask
     mask_kernel<<<(n_scores + 255)/256, 256>>>(scores, T, total_len, n_head, pos);
 
     // Softmax over each row of length T
@@ -784,10 +736,10 @@ void test_block(Model *m) {
     }
     fclose(embed_f);
     
-    float *layer0_buffer = (float*)malloc(3840 * sizeof(float));
+    float *layer_ref = (float*)malloc(3840 * sizeof(float));
     FILE *layer_f = fopen("../export/oracle_layer00.bin", "rb");
     if (!layer_f) {printf("Could not open oracle_layer00.bin\n"); return;}
-    if (fread(layer0_buffer, sizeof(float), 3840, layer_f) != 3840) {
+    if (fread(layer_ref, sizeof(float), 3840, layer_f) != 3840) {
         printf("Short Read\n"); fclose(layer_f); return;
     }
     fclose(layer_f);
@@ -814,7 +766,7 @@ void test_block(Model *m) {
         char path[126];
         sprintf(path, "../export/oracle_layer%02d.bin", layer);
         FILE *lf = fopen(path, "rb");
-        fread(layer0_buffer, sizeof(float), 3840, lf);
+        if (fread(layer_ref, sizeof(float), 3840, lf) != 3840) printf("short read\n");
         fclose(lf);
 
         CHECK(cudaMemcpy(embed_buffer, x, 3840 * sizeof(float), cudaMemcpyDeviceToHost));
@@ -823,14 +775,14 @@ void test_block(Model *m) {
         float maxRel  = 0.0f;
         float maxVal  = 0.0f;
         for (size_t i = 0; i < 3840; i++) {
-            float d = fabsf(embed_buffer[i] - layer0_buffer[i]);
+            float d = fabsf(embed_buffer[i] - layer_ref[i]);
             if (d > maxDiff) maxDiff = d;
 
-            float den = fabsf(layer0_buffer[i]) + 1e-3f;
+            float den = fabsf(layer_ref[i]) + 1e-3f;
             float r = d / den;
             if (r > maxRel) maxRel = r;
 
-            if (fabsf(layer0_buffer[i]) > maxVal) maxVal = fabsf(layer0_buffer[i]);
+            if (fabsf(layer_ref[i]) > maxVal) maxVal = fabsf(layer_ref[i]);
         }
         printf("layer %2d: abs %.3e  rel %.3e  max|ref| %.2f  %s\n",
                layer, maxDiff, maxRel, maxVal,
@@ -845,7 +797,7 @@ void test_block(Model *m) {
     cudaFree(hidden);
     cudaFree(tmp);
     free(embed_buffer);
-    free(layer0_buffer);
+    free(layer_ref);
 }
 
 void forward_pass(Model *m, const int *d_tokens, float *logits, float *x, float *ln_out, float *qkv, float *scores, float *attn_out, float *hidden, float *tmp, float *k_cache, float *v_cache, int pos, int T, int max_T) {
@@ -865,7 +817,6 @@ void forward_pass(Model *m, const int *d_tokens, float *logits, float *x, float 
     layerNorm_kernel<<<T, 256>>>(x, ln_out, m->ln_f_w, m->ln_f_b, T, d);
 
     // Project to Vocabulary - no bias, uses the transposed wte
-    dim3 tpb(16, 16);
     dim3 grid((m->vocab_size + 15)/16, (T + 15)/16);
     matmul_gpu(ln_out, m->wte_T, NULL, logits, T, m->vocab_size, d);
 }
@@ -941,7 +892,6 @@ void test_forward(Model *m) {
         printf("%d ", best);
         last[best] = -INFINITY;
     }
-    printf("\nexpected: 11 262 290 13 257\n");
 
     float *ref_last = h_ref + (size_t)(T - 1) * vocab;
     printf("top5 ref: ");
@@ -965,7 +915,6 @@ void forward_pass_profiled(Model *m, const int *d_tokens, float *logits, float *
     int total_len = pos + T;
     size_t n = (size_t)T * d;
     int blocks = (n + 255) / 256;
-    dim3 tpb(16, 16);
 
     cudaEvent_t _s, _e;
     cudaEventCreate(&_s); cudaEventCreate(&_e);
@@ -1099,7 +1048,6 @@ int main(int argc, char **argv) {
     test_layernorm();
     softmax_test();
     test_embed(&m);
-    // test_scores();
     test_block(&m);
     test_cache(&m);
     test_forward(&m);

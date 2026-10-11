@@ -7,7 +7,7 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 
-#define TILE 32
+#define TILE 16
 
 #define BM 64
 #define BN 64
@@ -218,7 +218,6 @@ Kernel kernels[] = {
     {"tiled",  launch_tiled},
     {"1d",     launch_1d},
     {"2d",     launch_2d},
-    // your new kernels get added here
 };
 const int NK = sizeof(kernels) / sizeof(kernels[0]);
 

@@ -20,7 +20,7 @@ diff = np.abs(ref - here)
 print(f"Max Abs Difference: {diff.max():.6e}")
 print(f"Mean Abs Difference: {diff.mean():.6e}")
 
-# We need the difference to be less than 1e-3, error here means there is an issue with the implementation of the formaula somewhere in GELU, layerNorm etc
+# We need the difference to be less than 1e-3, error here means there is an issue with the implementation of the formula somewhere in GELU, layerNorm etc
 if diff.max() < 1e-3:
     print("PASS")
 else:

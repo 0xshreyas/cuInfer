@@ -15,3 +15,17 @@ phase0/rounding
 bench/bench_matmul
 *.sass
 sass.txt
+a.out
+src/model
+src/model_old
+src/model_test
+src/loader
+src/*.txt
+src/*.bak
+bench/bench_matmul
+bench/ncu_*.txt
+phase0/matmul
+phase0/vecadd
+phase0/hello
+phase0/devinfo
+review_*.txt
