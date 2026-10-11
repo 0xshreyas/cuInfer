@@ -80,8 +80,8 @@ No single kernel wins everywhere, so the engine picks one per matmul (`src/matmu
 Requirements: an NVIDIA GPU, the CUDA toolkit, and Python 3. Tested on an RTX 5060 Laptop GPU with CUDA 13.3 under WSL2.
 
 ```bash
-git clone https://github.com/0xshreyas/cuinfer.git
-cd cuinfer
+git clone https://github.com/0xshreyas/cuInfer.git
+cd cuInfer
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 
